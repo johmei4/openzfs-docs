@@ -1,32 +1,67 @@
-name: Export OpenZFS docs for NotebookLM
-on:
-  workflow_dispatch: {}   # run it manually
+name: Export OpenZFS docs for NotebookLM (singlehtml->txt)
+on: { workflow_dispatch: {} }
 
 jobs:
-  build-text:
+  singlehtml_to_txt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with: { python-version: '3.x' }
-      - name: Install Sphinx & doc deps
+
+      - name: Install deps (Sphinx + HTML parsing)
         run: |
           python -m pip install -U pip
           python -m pip install -r docs/requirements.txt
-      - name: Build Sphinx text & split into NotebookLM chunks
+          python -m pip install beautifulsoup4 lxml
+
+      - name: Build single-page HTML
         working-directory: docs
         run: |
-          make text
+          make singlehtml
+          # sanity check: this file should be several MB, not KB
+          ls -lh _build/singlehtml/index.html
+          wc -c  _build/singlehtml/index.html
+
+      - name: Convert singlehtml -> TXT and split for NotebookLM
+        working-directory: docs
+        run: |
           python - <<'PY'
-          import glob, pathlib
-          files = sorted(glob.glob('_build/text/*.txt'))
-          text = '\n\n'.join(open(f, encoding='utf-8', errors='ignore').read() for f in files)
-          words = text.split()
-          CHUNK = 400_000  # keep well under NotebookLM's 500k/source cap
-          out = pathlib.Path('_build/notebooklm'); out.mkdir(parents=True, exist_ok=True)
-          for i in range(0, len(words), CHUNK):
-              (out / f'openzfs-docs-{i//CHUNK+1:02}.txt').write_text(' '.join(words[i:i+CHUNK]), encoding='utf-8')
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+          import re
+
+          html_path = Path('_build/singlehtml/index.html')
+          html = html_path.read_text(encoding='utf-8', errors='ignore')
+
+          soup = BeautifulSoup(html, 'lxml')
+
+          # strip obvious chrome
+          for sel in [
+            'nav', 'header', 'footer', 'script', 'style',
+            'div.related', 'div.sphinxsidebar', 'div#searchbox',
+            'div#navbar', 'div#breadcrumbs'
+          ]:
+              for t in soup.select(sel):
+                  t.decompose()
+
+          # get body text with spacing
+          text = soup.get_text(separator=' ', strip=True)
+          # collapse whitespace
+          text = re.sub(r'\s+', ' ', text).strip()
+
+          outdir = Path('_build/notebooklm'); outdir.mkdir(parents=True, exist_ok=True)
+
+          # Split under NotebookLM's per-source limit (safety margin)
+          WORDS = text.split()
+          CHUNK = 400_000
+          for i in range(0, len(WORDS), CHUNK):
+              chunk = ' '.join(WORDS[i:i+CHUNK])
+              (outdir / f'openzfs-docs-{i//CHUNK+1:02}.txt').write_text(chunk, encoding='utf-8')
+          print("Chunks written to", outdir)
           PY
+
       - name: Upload TXT artifacts
         uses: actions/upload-artifact@v4
         with:
