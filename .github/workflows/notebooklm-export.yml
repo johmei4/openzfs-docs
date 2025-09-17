@@ -1,4 +1,4 @@
-name: Export OpenZFS docs for NotebookLM (singlehtml->txt)
+name: Export OpenZFS docs for NotebookLM (verify sizes)
 on: { workflow_dispatch: {} }
 
 jobs:
@@ -6,64 +6,98 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with: { python-version: '3.x' }
-
-      - name: Install deps (Sphinx + HTML parsing)
+      - name: Install deps (Sphinx + parser)
         run: |
           python -m pip install -U pip
           python -m pip install -r docs/requirements.txt
           python -m pip install beautifulsoup4 lxml
-
       - name: Build single-page HTML
         working-directory: docs
         run: |
           make singlehtml
-          # sanity check: this file should be several MB, not KB
           ls -lh _build/singlehtml/index.html
-          wc -c  _build/singlehtml/index.html
+      - name: Extract text from singlehtml & report size
+        working-directory: docs
+        run: |
+          python - <<'PY'
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+          import re, sys
+          html = Path('_build/singlehtml/index.html').read_text(encoding='utf-8', errors='ignore')
+          soup = BeautifulSoup(html, 'lxml')
+          for sel in ['nav','header','footer','script','style','div.related','div.sphinxsidebar','div#searchbox','div#navbar','div#breadcrumbs']:
+              for t in soup.select(sel): t.decompose()
+          text = soup.get_text(separator=' ', strip=True)
+          text = re.sub(r'\s+', ' ', text).strip()
+          p = Path('_build/notebooklm'); p.mkdir(parents=True, exist_ok=True)
+          raw = p / 'singlehtml-raw.txt'
+          raw.write_text(text, encoding='utf-8')
+          words = len(text.split()); bytes_ = len(text.encode('utf-8'))
+          print(f"[singlehtml] words={words:,}  bytes={bytes_:,}")
+          # split under NotebookLM cap
+          CHUNK = 400_000; W = text.split()
+          for i in range(0, len(W), CHUNK):
+              (p / f'openzfs-docs-singlehtml-{i//CHUNK+1:02}.txt').write_text(' '.join(W[i:i+CHUNK]), encoding='utf-8')
+          PY
+          wc -w _build/notebooklm/singlehtml-raw.txt || true
+      - name: Upload TXT (singlehtml)
+        uses: actions/upload-artifact@v4
+        with:
+          name: openzfs-notebooklm-singlehtml
+          path: docs/_build/notebooklm/*.txt
 
-      - name: Convert singlehtml -> TXT and split for NotebookLM
+  html_crawl_to_txt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Install deps (Sphinx + parser)
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r docs/requirements.txt
+          python -m pip install beautifulsoup4 lxml
+      - name: Build multi-page HTML
+        working-directory: docs
+        run: |
+          make html
+          du -sh _build/html || true
+      - name: Crawl all HTML pages -> TXT & report size
         working-directory: docs
         run: |
           python - <<'PY'
           from bs4 import BeautifulSoup
           from pathlib import Path
           import re
-
-          html_path = Path('_build/singlehtml/index.html')
-          html = html_path.read_text(encoding='utf-8', errors='ignore')
-
-          soup = BeautifulSoup(html, 'lxml')
-
-          # strip obvious chrome
-          for sel in [
-            'nav', 'header', 'footer', 'script', 'style',
-            'div.related', 'div.sphinxsidebar', 'div#searchbox',
-            'div#navbar', 'div#breadcrumbs'
-          ]:
-              for t in soup.select(sel):
-                  t.decompose()
-
-          # get body text with spacing
-          text = soup.get_text(separator=' ', strip=True)
-          # collapse whitespace
-          text = re.sub(r'\s+', ' ', text).strip()
-
+          root = Path('_build/html')
+          pages = sorted([p for p in root.rglob('*.html') if p.name not in ('genindex.html','search.html','py-modindex.html')])
+          texts = []
+          for p in pages:
+            html = p.read_text(encoding='utf-8', errors='ignore')
+            soup = BeautifulSoup(html, 'lxml')
+            # grab only the main content area if present
+            main = soup.select_one('[role=main]') or soup.select_one('div.document') or soup.body
+            for sel in ['nav','header','footer','script','style','div.related','div.sphinxsidebar','div#searchbox','div#navbar','div#breadcrumbs']:
+              for t in (main or soup).select(sel): t.decompose()
+            t = (main or soup).get_text(separator=' ', strip=True)
+            t = re.sub(r'\s+', ' ', t).strip()
+            texts.append(t)
+          text = '\n\n'.join(texts)
           outdir = Path('_build/notebooklm'); outdir.mkdir(parents=True, exist_ok=True)
-
-          # Split under NotebookLM's per-source limit (safety margin)
-          WORDS = text.split()
-          CHUNK = 400_000
-          for i in range(0, len(WORDS), CHUNK):
-              chunk = ' '.join(WORDS[i:i+CHUNK])
-              (outdir / f'openzfs-docs-{i//CHUNK+1:02}.txt').write_text(chunk, encoding='utf-8')
-          print("Chunks written to", outdir)
+          raw = outdir / 'htmlcrawl-raw.txt'; raw.write_text(text, encoding='utf-8')
+          words = len(text.split()); bytes_ = len(text.encode('utf-8'))
+          print(f"[html-crawl] pages={len(pages)}  words={words:,}  bytes={bytes_:,}")
+          CHUNK=400_000; W=text.split()
+          for i in range(0, len(W), CHUNK):
+            (outdir / f'openzfs-docs-htmlcrawl-{i//CHUNK+1:02}.txt').write_text(' '.join(W[i:i+CHUNK]), encoding='utf-8')
           PY
-
-      - name: Upload TXT artifacts
+          wc -w _build/notebooklm/htmlcrawl-raw.txt || true
+      - name: Upload TXT (html-crawl)
         uses: actions/upload-artifact@v4
         with:
-          name: openzfs-notebooklm-txt
-          path: docs/_build/notebooklm/*.txt
+          name: openzfs-notebooklm-htmlcrawl
+          path: |
+            docs/_build/notebooklm/openzfs-docs-htmlcrawl-*.txt
+            docs/_build/notebooklm/htmlcrawl-raw.txt
